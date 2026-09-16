@@ -1,0 +1,97 @@
+{
+  "career_profile_path": "../profile/career-profile.md",
+  "job_preferences_path": "../profile/job-preferences.md",
+  "tracker_path": "../tracker/applications.csv",
+  "ollama_model": "qwen2.5:14b",
+  "ollama_url": "http://localhost:11434/api/generate",
+  "min_score_to_show": 60,
+  "_note_naukri": "naukri is still excluded directly (406 recaptcha) — the 'google' entries below indirectly recover some Naukri-originated postings via Google Jobs' aggregation.",
+  "searches": [
+    {
+      "search_term": "Senior Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Principal Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Distributed Systems Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "AI Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Backend Engineering Manager",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Vice President Engineering",
+      "location": "India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India",
+      "is_remote": true
+    },
+    {
+      "search_term": "AI Architect",
+      "location": "India",
+      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India",
+      "is_remote": true
+    },
+    {
+      "search_term": "Architect",
+      "google_search_term": "Senior Architect jobs in Chennai posted this week",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["google"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "AI Architect",
+      "google_search_term": "AI Architect jobs in Chennai posted this week",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["google"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Engineering Manager",
+      "google_search_term": "remote Engineering Manager jobs India posted this week",
+      "location": "India",
+      "site_name": ["google"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India",
+      "is_remote": true
+    }
+  ]
+}

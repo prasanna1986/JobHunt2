@@ -1,0 +1,68 @@
+{
+  "career_profile_path": "../profile/career-profile.md",
+  "job_preferences_path": "../profile/job-preferences.md",
+  "tracker_path": "../tracker/applications.csv",
+  "ollama_model": "qwen2.5:14b",
+  "ollama_url": "http://localhost:11434/api/generate",
+  "min_score_to_show": 60,
+  "searches": [
+    {
+      "search_term": "Senior Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Principal Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Distributed Systems Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "AI Architect",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Backend Engineering Manager",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
+    },
+    {
+      "search_term": "Vice President Engineering",
+      "location": "India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India",
+      "is_remote": true
+    },
+    {
+      "search_term": "AI Architect",
+      "location": "India",
+      "site_name": ["linkedin", "indeed"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India",
+      "is_remote": true
+    }
+  ]
+}
