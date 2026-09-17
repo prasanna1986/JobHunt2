@@ -1,26 +1,20 @@
-# Local AI Job Search & Application System — India (v3, Automated)
+# Local AI Job Search & Application System — India (v4, Automated)
 
-## What changed from v2
+## What changed from v3
 
-v2 was a **manual** system: you opened Naukri/LinkedIn/Indeed yourself, copy-pasted job text into an Ollama chat window, and copy-pasted the answer back into Notepad. It worked, but you did almost every step by hand.
+v3 introduced `pipeline.py` as an automated FIND + SCORE loop replacing manual portal-browsing.
+v4 hardens and extends that same pipeline without changing the daily routine:
 
-v3 keeps the same philosophy (local AI, factual career profile, Chennai-first priorities, **you click Submit**) but replaces the manual steps with three real, open-source tools that do the heavy lifting for you:
-
-| Job | Tool | What it replaces |
-|---|---|---|
-| Search Naukri + LinkedIn + Indeed at once | **JobSpy** (`speedyapply/JobSpy`) — a Python scraping library | Manually opening three portals and typing the same keywords into each |
-| Score every new job against your profile & preferences | **`pipeline.py`** (built for you below, wraps JobSpy + your local Ollama) | Manually pasting each job description into Ollama one at a time |
-| Tailor a resume + get an ATS score for a specific job | **Resume Matcher** (`srbhr/Resume-Matcher`) — a local web app | Manually pasting resumes into Ollama and eyeballing keyword fit |
-| Track applications | A CSV tracker (kept from v2 — still the simplest reliable option) | — |
-
-Your new daily loop is: **a script finds and scores jobs overnight → you open one ranked shortlist → you tailor the 1–2 you like in a local web app → you personally apply.**
-
-> **What we deliberately did *not* use:** there is a whole category of GitHub projects (AIHawk-style bots, "auto-apply to 1,000 jobs" agents) that drive a real browser and click Submit for you. We're not using one of these, on purpose:
-> - Several were built for **LinkedIn Easy Apply**, and LinkedIn has already pushed back on this category of automation (the original AIHawk project shut down its LinkedIn auto-apply feature after platform pressure and is now a different, proprietary product).
-> - Mass-applying with a bot produces low-quality, generic applications that recruiters increasingly recognise and filter out — it works against the "fewer, better applications" principle this SOP is built on.
-> - Automated form-filling can silently submit wrong answers (CTC, notice period, relocation) with no human check, which is exactly the failure mode this SOP exists to prevent.
->
-> Everything below stops at "tailored, fact-checked, ATS-passed resume, ready for you to submit." That boundary is intentional, not a limitation.
+| Change | Detail |
+|---|---|
+| **Scoring spread** | Old pipeline anchored at score 85 for every APPLY job. New rubric-based prompt forces the model to construct the score from weighted axes, producing real spread (e.g. 92 for a perfect Chennai + target-title + A-company match vs 62 for a borderline role with unknown salary). |
+| **Score breakdown in CSV** | Every row now includes a `score_breakdown` column (`base=50 \| location_fit=15 \| ...`) so you can see exactly why a job scored what it did. |
+| **Company score column** | A separate Ollama call rates the *hiring company* (0–100, tier A/B/UNKNOWN) independent of role fit. Your `target-companies.csv` is now read at startup and used to anchor the company score for known priority companies. |
+| **Closed-position detection** | At the start of every run, APPLY/HOLD jobs from all previous shortlists are checked against the current scrape. Any that no longer appear are written into today's shortlist with `decision=CLOSED` — so you know immediately which roles to deprioritise in outreach. |
+| **Resume capability** | If a run is interrupted (crash, Ctrl+C, power loss), re-running the same command picks up exactly where it left off. Two safety layers: `seen_jobs.csv` + a secondary check against today's shortlist CSV so a job is never re-scored even if `seen_jobs.csv` missed a write. |
+| **Smart HTTP retry** | Transient scrape failures (429 rate-limit, 5xx server errors, network drops) are retried with exponential backoff. Permanent blocks (400, 403, 406) are skipped immediately — no wasted time retrying Glassdoor or Naukri. |
+| **Active sites** | LinkedIn + Indeed (primary). Google Jobs aggregation recovers some Naukri-sourced postings. Glassdoor (400/403 blocked), Naukri (406 recaptcha), zip_recruiter (US-only) excluded from default config. |
+| **PowerShell-safe output** | All console output is ASCII-safe; stdout is reconfigured to UTF-8 with `errors=replace` so Unicode in job titles never crashes the terminal. jobspy's internal INFO/ERROR logging is suppressed at the root level so PowerShell no longer reports exit-code 1. |
 
 ---
 
@@ -57,10 +51,10 @@ mkdir tools
 ```text
 C:\CareerAI\
 ├── profile\        (career-profile.md, job-preferences.md, resume.pdf, target-companies.csv)
-├── automation\      (pipeline.py, config.json — the FIND+SCORE robot)
-├── tools\           (Resume Matcher lives here)
-├── applications\    (tailored resumes per job)
-├── tracker\         (applications.csv)
+├── automation\     (pipeline.py, config.json, seen_jobs.csv, shortlist\)
+├── tools\          (Resume Matcher lives here)
+├── applications\   (tailored resumes per job)
+├── tracker\        (applications.csv)
 └── inbox\
 ```
 
@@ -71,7 +65,7 @@ Install:
 - **Ollama** — runs the local AI model.
 - **Git** — downloads the tools.
 - **Node.js 22+** — required by Resume Matcher's web interface.
-- **Python 3.10+** (3.13+ recommended) — runs the pipeline script and Resume Matcher's backend.
+- **Python 3.10+** (3.12+ recommended) — runs the pipeline script and Resume Matcher's backend.
 - **uv** — a fast Python package manager Resume Matcher uses. Install from `astral.sh/uv` or `pip install uv`.
 
 Verify each in a **new** PowerShell window:
@@ -89,7 +83,7 @@ uv --version
 pip install -U python-jobspy requests
 ```
 
-`python-jobspy` is the open-source scraping library that talks to Naukri, LinkedIn and Indeed for you. Python 3.10 or newer is required.
+`python-jobspy` is the open-source scraping library that talks to LinkedIn, Indeed, and Google Jobs for you. Python 3.10 or newer is required.
 
 ---
 
@@ -107,16 +101,23 @@ Leave this window open. Open a **second** PowerShell window for everything else.
 
 ## Step 2 — Download the model
 
-12 GB+ RAM available to Ollama:
+Use whichever model you have available. The pipeline reads `ollama_model` from `config.json` so you can change it any time without editing `pipeline.py`.
 
 ```powershell
+# Good balance of speed and quality (12 GB+ RAM):
 ollama pull qwen2.5:14b
+
+# If you have more VRAM (27B):
+ollama pull qwen3.8:27b
+
+# Smaller machine (8 GB RAM):
+ollama pull llama3.1:8b
 ```
 
-Smaller machine:
+To see which models are installed:
 
 ```powershell
-ollama pull llama3.1:8b
+ollama list
 ```
 
 ## Step 3 — Test the model
@@ -125,7 +126,7 @@ ollama pull llama3.1:8b
 ollama run qwen2.5:14b
 ```
 
-Type `Reply with exactly: LOCAL AI READY`. When it replies correctly, press `Ctrl+C`. Your local AI is ready — and every tool in this guide (the pipeline script and Resume Matcher) will talk to this same running Ollama instance, so you only ever set this up once.
+Type `Reply with exactly: LOCAL AI READY`. When it replies correctly, press `Ctrl+C`. Your local AI is ready — every tool in this guide talks to the same running Ollama instance, so you only set this up once.
 
 ---
 
@@ -216,7 +217,7 @@ If anything is wrong, fix the **source text** and regenerate — never hand-edit
 
 # Part 5 — Create your Chennai-first Job Preferences
 
-Create `C:\CareerAI\profile\job-preferences.md`. This file is no longer just something you paste into a chat — **`pipeline.py` reads it on every run**, so keep it accurate.
+Create `C:\CareerAI\profile\job-preferences.md`. This file is no longer just something you paste into a chat — **`pipeline.py` reads it on every run for both role scoring and company scoring**, so keep it accurate.
 
 ```text
 TARGET LOCATION: Chennai, Tamil Nadu
@@ -249,6 +250,9 @@ PRIMARY CAREER LANES:
 PREFERRED INDUSTRIES: Product software, SaaS, FinTech, Banking/FinTech, Cloud/infrastructure,
 Enterprise technology, GCC engineering centres
 
+COMPANIES TO PRIORITIZE:
+[List your Priority A companies — pipeline uses this to boost company_score]
+
 COMPANIES / ROLES TO AVOID:
 Roles with unclear salary obviously below target
 Mandatory relocation away from Chennai
@@ -265,7 +269,7 @@ Replace every bracketed placeholder before you run the pipeline for the first ti
 
 ---
 
-# Part 6 — Your Chennai target-company list (unchanged)
+# Part 6 — Your Chennai target-company list
 
 Create `C:\CareerAI\profile\target-companies.csv` with columns:
 
@@ -273,7 +277,9 @@ Create `C:\CareerAI\profile\target-companies.csv` with columns:
 Company,Priority,Chennai,RemoteIndia,ProductOrGCC,CompensationPotential,CultureCheck,OfficialCareersChecked,LinkedInChecked,NaukriChecked,LastChecked,Notes
 ```
 
-Seed it with your Priority A/B/C companies (Amazon, Walmart Global Tech, PayPal, Freshworks, Zoho, Wells Fargo, Citi, Qualcomm, Workday, Cisco, and your B/C lists). You still review this list weekly by hand (Part 10) — the automation in Part 7 covers job-board search, not "does this specific company have a Chennai office right now," which still needs a human glance at the official careers page.
+Seed it with your Priority A/B companies. The pipeline now reads this file at startup — Priority A companies automatically get a boosted `company_score` floor of 82, Priority B companies get 70, so they sort higher in the shortlist even when the model underestimates them.
+
+You still review this list weekly by hand (Part 10) — the automation covers job-board search, not "does this specific company have a Chennai office right now," which still needs a human glance at the official careers page.
 
 ---
 
@@ -291,23 +297,17 @@ Save these two files into `C:\CareerAI\automation\`:
 {
   "career_profile_path": "../profile/career-profile.md",
   "job_preferences_path": "../profile/job-preferences.md",
+  "target_companies_path": "../profile/target-companies.csv",
   "tracker_path": "../tracker/applications.csv",
   "ollama_model": "qwen2.5:14b",
   "ollama_url": "http://localhost:11434/api/generate",
   "min_score_to_show": 60,
+  "max_retries": 2,
   "searches": [
     {
-      "search_term": "Engineering Manager",
+      "search_term": "Senior Architect",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["naukri", "linkedin", "indeed"],
-      "results_wanted": 25,
-      "hours_old": 72,
-      "country_indeed": "India"
-    },
-    {
-      "search_term": "Java Architect",
-      "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["naukri", "linkedin", "indeed"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
@@ -315,45 +315,58 @@ Save these two files into `C:\CareerAI\automation\`:
     {
       "search_term": "AI Architect",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["naukri", "linkedin", "indeed"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
     },
     {
-      "search_term": "Engineering Manager",
+      "search_term": "Vice President Engineering",
       "location": "India",
-      "site_name": ["naukri", "linkedin", "indeed"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India",
       "is_remote": true
+    },
+    {
+      "search_term": "Architect",
+      "google_search_term": "Senior Architect jobs in Chennai posted this week",
+      "location": "Chennai, Tamil Nadu, India",
+      "site_name": ["google"],
+      "results_wanted": 25,
+      "hours_old": 72,
+      "country_indeed": "India"
     }
   ]
 }
 ```
 
+Key `config.json` fields:
+
+| Field | Purpose |
+|---|---|
+| `ollama_model` | Must match `ollama list` — change without editing pipeline.py |
+| `max_retries` | Extra attempts on 429/5xx/network errors (default 2). 4xx blocks are never retried. |
+| `min_score_to_show` | Role score threshold for the terminal digest (CSV always has everything) |
+| `target_companies_path` | Feeds the company scoring call; Priority A/B rows get a score floor |
+| `google_search_term` | Used instead of `search_term` when `site_name` is `["google"]` |
+
 Add one `searches` entry per career lane from Appendix A — this is the automated equivalent of the old "create separate alerts" steps in LinkedIn/Indeed.
 
 ### Why Naukri isn't in the automated scrape
 
-Naukri actively fingerprints and reCAPTCHA-blocks scraping traffic — you'll see `Naukri API response status code 406 - recaptcha required` in the log. This isn't a bug in your setup; it's Naukri's anti-bot layer working as designed. Even paid commercial Naukri-scraping services need rotating **residential proxies** (real Indian home IPs, at real cost) to get past it reliably, and it still isn't guaranteed. That's a lot of complexity and money for a portal that already has a good native alert system.
-
-So `config.json` above deliberately only scrapes `linkedin` and `indeed`. **Keep Naukri on its own native alerts instead** — this is the one place v2's manual setup was actually the right tool:
+Naukri actively fingerprints and reCAPTCHA-blocks scraping traffic — you'll see `status code 406` in the log. This isn't a bug; it's Naukri's anti-bot layer. The pipeline detects 406 as a permanent block and skips it immediately (no retry). **Keep Naukri on its own native alerts instead:**
 
 ```text
-Naukri → Profile → keep Current location = Chennai, Preferred locations = Chennai
-first, salary/notice period accurate
-↓
-Naukri → Job Alerts → create one alert per career lane (Engineering Manager,
-Java Architect, AI Architect, etc.), Location: Chennai
+Naukri → Job Alerts → create one alert per career lane, Location: Chennai
 ↓
 Check the alert emails / app inbox for ~5 minutes as part of your daily routine
 ```
 
-If you later want Naukri automated too, the only reliable route is paying for a residential-proxy scraping service and passing the proxy list to JobSpy's `proxies` parameter — worth doing only if Naukri consistently surfaces roles the other two boards miss.
+Google Jobs searches in `config.json` partially recover Naukri-originated postings via aggregation.
 
-**`pipeline.py`** — the script itself (provided as a download alongside this guide). Read the comment at the top once; it explains exactly what it does and doesn't do.
+**`pipeline.py`** — the script itself. Read the comment at the top once; it explains exactly what it does and doesn't do.
 
 ## Step 2 — Test it without using the AI
 
@@ -362,7 +375,10 @@ cd C:\CareerAI\automation
 python pipeline.py --dry-run
 ```
 
-This only scrapes and de-duplicates, so you can confirm your searches return real Chennai/remote results before you spend Ollama time scoring them.
+This scrapes, de-duplicates, and checks previous shortlists for closed positions — without calling Ollama. You'll see:
+- How many new jobs were found
+- A `[NOT SCORED]` list of the first jobs in queue
+- A `[CLOSED]` list of APPLY/HOLD jobs from prior shortlists that no longer appear in today's scrape
 
 ## Step 3 — Run it for real
 
@@ -373,20 +389,55 @@ python pipeline.py
 What happens, with zero further input from you:
 
 ```text
-Reads career-profile.md and job-preferences.md
+Reads career-profile.md, job-preferences.md, and target-companies.csv
 ↓
-Scrapes Naukri + LinkedIn + Indeed for every search in config.json
+Scrapes LinkedIn + Indeed + Google Jobs for every search in config.json
+(transient 429/5xx errors retried automatically with backoff)
+↓
+Checks all APPLY/HOLD jobs from previous shortlists — marks any that have
+disappeared from today's scrape as CLOSED in today's shortlist
 ↓
 Drops jobs you've already seen or already applied to
 ↓
-Sends each new job to your local Ollama model for scoring
+For each new job:
+  - Role evaluation: Ollama scores it 0-100 via an explicit weighted rubric
+    with a full score_breakdown (not all 85 — real spread across the range)
+  - Company evaluation: separate Ollama call scores the hiring company 0-100,
+    anchored to your target-companies.csv for known priority companies
 ↓
-Writes automation\shortlist\shortlist_YYYY-MM-DD.csv, ranked highest score first
+Writes shortlist\shortlist_YYYY-MM-DD.csv, sorted by role score
 ↓
-Prints the jobs that cleared your score bar straight to the terminal
+Prints a terminal digest grouped by APPLY / HOLD / SKIP / CLOSED
 ```
 
-Each row already carries the same verdict shape as the old manual Part 14 prompt: `decision` (APPLY/HOLD/SKIP), `score`, `location_fit`, `compensation`, `role_fit`, `top_reasons`, `red_flags`. Open the CSV in Excel and sort/filter as you like.
+### Shortlist CSV columns
+
+| Column | What it is |
+|---|---|
+| `score` | Role fit score 0–100 (rubric-computed, real spread) |
+| `company_score` | Company desirability 0–100 (separate call) |
+| `company_tier` | A / B / UNKNOWN from target-companies.csv |
+| `decision` | APPLY / HOLD / SKIP / CLOSED |
+| `score_breakdown` | `base=50 \| location_fit=15 \| role_title_fit=10 \| ...` — full audit trail |
+| `top_reasons` | Why the model gave this verdict |
+| `red_flags` | Hard blockers detected |
+| `missing_information` | What the job posting didn't disclose |
+| `company_notes` | One-line rationale for the company score |
+
+### Resume flags
+
+| Flag | What it does |
+|---|---|
+| `--dry-run` | Scrape + stale-check only; no Ollama calls |
+| `--limit N` | Score only the next N new jobs this run |
+| `--date YYYY-MM-DD` | Write to a specific date's shortlist (for next-morning reruns) |
+| `--no-stale-check` | Skip closed-position detection |
+
+### Resuming after interruption
+
+If the script is interrupted (Ctrl+C, crash, power loss), just re-run the same command. Two safety layers ensure no job is re-scored or double-written:
+1. `seen_jobs.csv` — written per-job immediately after shortlist write
+2. Today's shortlist CSV is also read at startup — any URL already in it is skipped even if `seen_jobs.csv` missed the write
 
 ## Step 4 — Schedule it to run every morning (optional but recommended)
 
@@ -398,12 +449,12 @@ Arguments: C:\CareerAI\automation\pipeline.py
 Start in: C:\CareerAI\automation
 ```
 
-Now your shortlist is waiting for you before your first coffee, instead of you opening three tabs.
+Now your shortlist is waiting for you before your first coffee.
 
 ### A few important cautions
 
 - **Rate limits, not stealth.** JobSpy is a scraping library; job boards can rate-limit or temporarily block an IP that scrapes too aggressively. Keep `results_wanted` modest (20–30), run once or twice a day, not in a tight loop.
-- **This reads job boards, it doesn't log in as you.** It never touches your Naukri/LinkedIn credentials, so there's no account-ban risk from the scraping itself — the risk category above (auto-*applying*) is a different tool category we're avoiding.
+- **This reads job boards, it doesn't log in as you.** It never touches your Naukri/LinkedIn credentials.
 - **Personal use only.** This is you automating your own job search, not building a scraping service for others.
 
 ---
@@ -429,7 +480,7 @@ cd apps\backend
 copy .env.example .env
 ```
 
-Open `.env` and point the AI provider setting at your local Ollama (the repo's `.env.example` documents the exact variable name and the Ollama option — set model to `qwen2.5:14b` or `llama3.1:8b` to match what you already pulled). Then:
+Open `.env` and point the AI provider setting at your local Ollama (the repo's `.env.example` documents the exact variable name — set model to match what you have in `config.json`). Then:
 
 ```powershell
 uv sync
@@ -463,7 +514,7 @@ Export the tailored resume as PDF
 
 ## Step 5 — Keep the fact-check guardrail (do not skip this)
 
-Resume Matcher optimises for ATS keyword match — it does **not** independently verify that every rewritten line is still literally true against your Career Profile. Before you save the final version, paste the tailored resume back into your Ollama window (or Resume Matcher's own chat) with:
+Resume Matcher optimises for ATS keyword match — it does **not** independently verify that every rewritten line is still literally true against your Career Profile. Before you save the final version, paste the tailored resume back into Ollama with:
 
 ```text
 FACT CHECK THIS RESUME.
@@ -506,13 +557,15 @@ Copy the `JobURL` straight from the shortlist CSV — this is also the field `pi
 ## Every day (10–15 minutes of your time, not 45–60)
 
 ```text
-5 min  → Check Naukri alert emails/app (the one portal the script can't reach)
-5–10 min → Open automation\shortlist\shortlist_<today>.csv (LinkedIn + Indeed,
-           already scraped and scored overnight)
+5 min  → Check Naukri alert emails/app (the one portal the script can't reach directly)
+5–10 min → Open automation\shortlist\shortlist_<today>.csv
+           (already scraped and scored overnight, grouped APPLY / HOLD / SKIP / CLOSED)
 ↓
-Skim top-ranked rows; read the AI's top_reasons and red_flags columns
+Scan the CLOSED section first — deprioritise any outreach on those roles
 ↓
-Pick your 1–2 genuinely strong matches (from either source)
+Skim top APPLY rows; read score_breakdown, top_reasons, red_flags
+↓
+Pick your 1–2 genuinely strong matches (role score AND company score both high)
 ↓
 Resume Matcher: tailor → fact-check → ATS score
 ↓
@@ -554,15 +607,19 @@ Do not make conclusions where the dataset is too small.
 ```text
 Engineering Manager · Senior Engineering Manager · Software Engineering Manager
 Backend Engineering Manager · Engineering Director · Head of Engineering
-Java Architect · Backend Architect · Solutions Architect · Principal Engineer Java
-Staff Engineer Java · Microservices Architect · Platform Architect · Cloud Architect
+Senior Architect · Principal Architect · Enterprise Architect · Staff Architect
+Solutions Architect · Backend Architect · Distributed Systems Architect
+Platform Architect · Cloud Architect · Microservices Architect
 AI Architect · GenAI Architect · AI Engineering Manager · AI Platform Architect
 Machine Learning Architect · Generative AI Lead · LLM Architect
+Vice President Engineering · Senior Vice President Engineering
 ```
 
 ---
 
-# Appendix B — Company research prompt (still manual — run this when checking a specific company)
+# Appendix B — Company research prompt (now partially automated — `company_score` handles a first pass)
+
+The pipeline now produces a `company_score` and `company_notes` for every job automatically. For companies that score high or that you're seriously considering, run a deeper manual check:
 
 ```text
 Evaluate this company as a potential employer for me.
@@ -615,7 +672,7 @@ Levels.fyi's Chennai leaderboard is one useful benchmark, but it's built from se
 
 ---
 
-# Appendix F — Privacy notes for this v3 stack
+# Appendix F — Privacy notes for this v4 stack
 
 - **Ollama**: your career profile, preferences and every job description are processed by a model running on your own machine — nothing leaves it during scoring.
 - **`pipeline.py`**: only talks to (a) the public job-board pages JobSpy fetches and (b) your local Ollama endpoint. It writes plain CSVs to your own disk.
@@ -626,17 +683,23 @@ Levels.fyi's Chennai leaderboard is one useful benchmark, but it's built from se
 
 # Appendix G — Troubleshooting
 
-**`Naukri API response status code 406 - recaptcha required`** → expected and not fixable by retrying — see "Why Naukri isn't in the automated scrape" in Part 7. Use Naukri's native alerts instead; the pipeline still covers LinkedIn + Indeed.
+**`status code 406` (Naukri) or `status code 403` (Glassdoor)** → expected permanent blocks; the pipeline skips these immediately without retry and logs `[FAIL] HTTP 4xx (no retry)`. Use Naukri's native alerts. Glassdoor is excluded from `config.json`.
+
+**`status code 429` or `5xx` on LinkedIn/Indeed** → the pipeline retries automatically with exponential backoff (10s → 20s → 40s for 5xx; 60s → 120s for 429). If it still fails after `max_retries` attempts, that search is skipped for this run and will retry next run.
 
 **`python-jobspy` import error** → `pip install -U python-jobspy` (package name has a hyphen; the Python import is `from jobspy import scrape_jobs`, no hyphen).
 
 **Pipeline returns 0 new jobs every day** → check `automation\seen_jobs.csv`; delete it if you want to reprocess everything from scratch, or it means your searches genuinely aren't finding new postings — widen `hours_old` or add more `searches` entries from Appendix A.
 
-**Ollama call in `pipeline.py` times out or errors** → confirm `ollama serve` is running and `ollama_url`/`ollama_model` in `config.json` match what you pulled (`ollama list` to check installed models).
+**All jobs are getting the same score (85)** → you're running an old version of `pipeline.py`. The v4 pipeline uses a weighted rubric prompt that forces real score spread. Pull the latest file.
+
+**Ollama call in `pipeline.py` times out or errors** → confirm `ollama serve` is running and `ollama_model` in `config.json` matches `ollama list`. Company scoring uses a separate 60s timeout; role scoring uses 180s.
+
+**Too many CLOSED positions on first run** → normal on the first run after upgrading to v4 — the stale checker is comparing all prior shortlists (which may be weeks old) against today's scrape. Subsequent runs will only show genuinely new closures.
 
 **Resume Matcher backend won't start** → re-check `.env` for a valid AI provider block; re-run `uv sync` inside `apps/backend`.
 
-**Model is too slow** → switch both `config.json` and Resume Matcher's `.env` to `llama3.1:8b`.
+**Model is too slow** → switch `ollama_model` in `config.json` to `llama3.1:8b` (no other file changes needed). Also match the model in Resume Matcher's `.env`.
 
 **AI is inventing details anywhere in the stack** → don't loosen the prompt; strengthen the Career Profile (Part 4), and re-run the strict fact-check prompt (Part 8, Step 5) before saving any resume.
 
@@ -649,12 +712,15 @@ Levels.fyi's Chennai leaderboard is one useful benchmark, but it's built from se
 [ ] Python 3.10+, Node 22+, Git, uv installed
 [ ] python-jobspy and requests installed (pip install -U python-jobspy requests)
 [ ] resume.pdf → resume-source.txt → career-profile.md created and verified
-[ ] job-preferences.md filled in with real numbers
-[ ] target-companies.csv seeded
-[ ] automation\config.json edited with your real search terms
-[ ] pipeline.py --dry-run tested successfully
-[ ] pipeline.py full run produced a shortlist CSV
-[ ] (optional) Task Scheduler entry created for a daily automatic run
+[ ] job-preferences.md filled in with real numbers (incl. COMPANIES TO PRIORITIZE)
+[ ] target-companies.csv seeded with Priority A/B companies
+[ ] automation\config.json edited:
+    [ ] ollama_model matches ollama list
+    [ ] target_companies_path set
+    [ ] searches tailored to your career lanes
+[ ] pipeline.py --dry-run tested: shows new jobs + CLOSED section (no errors)
+[ ] pipeline.py --limit 3 run: verify score spread (not all 85), company_score column present
+[ ] (optional) Task Scheduler entry created for daily automatic run
 [ ] Resume Matcher cloned, backend + frontend running against local Ollama
 [ ] tracker\applications.csv created
 ```

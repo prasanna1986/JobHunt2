@@ -1,16 +1,24 @@
 {
   "career_profile_path": "../profile/career-profile.md",
   "job_preferences_path": "../profile/job-preferences.md",
+  "target_companies_path": "../profile/target-companies.csv",
   "tracker_path": "../tracker/applications.csv",
-  "ollama_model": "qwen2.5:14b",
+  "ollama_model": "qwen3.8:27b",
   "ollama_url": "http://localhost:11434/api/generate",
   "min_score_to_show": 60,
-  "_note_naukri": "naukri is still excluded directly (406 recaptcha) — the 'google' entries below indirectly recover some Naukri-originated postings via Google Jobs' aggregation.",
+
+  "_note_timeouts": "Ollama calls wait forever by default (correct for slow local models). Add ollama_timeout_role and ollama_timeout_company (seconds) here only if you need a hard cap.",
+
+  "_note_retries": "max_retries controls extra attempts on transient failures (429, 5xx, network). Permanent blocks (400, 403, 406) are never retried.",
+  "max_retries": 2,
+
+  "_note_sites": "Active sites: linkedin, indeed, google. zip_recruiter (US-only, 0 India results) and bayt (403 blocked) removed. Glassdoor (400/403) and Naukri (406 recaptcha) excluded. Google aggregation recovers some Naukri-originated postings.",
+
   "searches": [
     {
       "search_term": "Senior Architect",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
@@ -18,7 +26,7 @@
     {
       "search_term": "Principal Architect",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
@@ -26,7 +34,7 @@
     {
       "search_term": "Distributed Systems Architect",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
@@ -34,7 +42,7 @@
     {
       "search_term": "AI Architect",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
@@ -42,7 +50,7 @@
     {
       "search_term": "Backend Engineering Manager",
       "location": "Chennai, Tamil Nadu, India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India"
@@ -50,7 +58,7 @@
     {
       "search_term": "Vice President Engineering",
       "location": "India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India",
@@ -59,7 +67,7 @@
     {
       "search_term": "AI Architect",
       "location": "India",
-      "site_name": ["linkedin", "indeed", "glassdoor"],
+      "site_name": ["linkedin", "indeed"],
       "results_wanted": 25,
       "hours_old": 72,
       "country_indeed": "India",
@@ -92,6 +100,15 @@
       "hours_old": 72,
       "country_indeed": "India",
       "is_remote": true
+    },
+    {
+      "search_term": "Principal Engineer",
+      "google_search_term": "Principal Engineer distributed systems AI jobs India site:linkedin.com OR site:naukri.com",
+      "location": "India",
+      "site_name": ["google"],
+      "results_wanted": 20,
+      "hours_old": 72,
+      "country_indeed": "India"
     }
   ]
 }
