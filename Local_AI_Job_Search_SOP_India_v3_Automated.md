@@ -468,79 +468,41 @@ Now your shortlist is waiting for you before your first coffee.
 
 ---
 
-# Part 8 — Install Resume Matcher (replaces the old copy-paste tailoring/ATS steps)
+# Part 8 — Interactive Application & ATS Resume Generation (`apply.py`)
 
-Once a job clears your shortlist as `APPLY`, this local web app takes the job description and your master resume and does the tailoring + ATS scoring interactively, using the same local Ollama model.
+Once a job clears your shortlist with a decision of `APPLY`, you can use the interactive `apply.py` script. This script takes the job description and your master resume, allows you to chat about the role with the local AI, and generates a perfectly tailored, ATS-friendly resume in both `.docx` and `.pdf` formats.
 
-## Step 1 — Clone it
-
-```powershell
-cd C:\CareerAI\tools
-git clone https://github.com/srbhr/Resume-Matcher.git
-cd Resume-Matcher
-```
-
-Prerequisites: Python 3.13+, Node.js 22+, `uv` (all installed in Part 2).
-
-## Step 2 — Start the backend (Terminal 1)
+## Step 1 — Run the Apply Script
 
 ```powershell
-cd apps\backend
-copy .env.example .env
+cd C:\CareerAI\automation
+python apply.py
 ```
 
-Open `.env` and point the AI provider setting at your local Ollama (the repo's `.env.example` documents the exact variable name — set model to match what you have in `config.json`). Then:
+The script will scan your master `shortlist.csv` for any jobs marked as `APPLY`. It will then present them one by one in your terminal, showing you the score breakdown and any red flags.
 
-```powershell
-uv sync
-uv run app
-```
+## Step 2 — Chat or Apply
 
-## Step 3 — Start the frontend (Terminal 2, new window)
+For each job, you will be prompted with:
+`[a]pply / [c]hat / [s]kip / [q]uit`
 
-```powershell
-cd C:\CareerAI\tools\Resume-Matcher\apps\frontend
-npm install
-npm run dev
-```
+* **`[c]hat`**: If you aren't sure whether you should apply based on the initial ranking, press `c`. This opens a mini chat interface where you can ask the local Ollama model direct questions like *"Does this job offer remote work?"* or *"Is my 5 years of Python sufficient for this?"*.
+* **`[s]kip`**: Skip to the next job in the list.
+* **`[a]pply`**: Proceeds to generate a tailored resume.
 
-Open the local URL it prints (typically `http://localhost:3000`).
+## Step 3 — Resume Tailoring & Review Loop
 
-## Step 4 — Use it per job
+When you press `[a]pply`, the script will:
+1. Ask if you have any custom instructions (e.g., *"Make sure to emphasize my leadership skills from my time at Cognizant"*).
+2. Use Ollama to tailor your `profile/resume-source.txt` specifically to the cached Job Description.
+3. Generate clean, ATS-compliant `.docx` and `.pdf` resumes inside `C:\CareerAI\applications\<Company>_<Role>\`.
 
-```text
-Upload your master resume (PDF/DOCX — export career-profile.md to a clean
-Word doc once, or use resume.pdf)
-↓
-Paste the job description from your shortlist CSV
-↓
-Review the match score, keyword gaps, and AI-tailored content
-↓
-Generate the matching cover letter
-↓
-Export the tailored resume as PDF
-```
+**Reviewing and Editing:**
+The script will then pause and ask you to open the generated `.pdf` or `.docx` file and review it:
+`Are you happy with this resume? [a]ccept / [e]dit / [c]ancel`
+* **`[e]dit`**: Type your feedback (e.g., *"make the summary punchier"*). Ollama will ingest your feedback and generate a brand new version of the PDF/DOCX!
+* **`[a]ccept`**: Logs your application in `tracker/applications.csv` and updates your `shortlist.csv` decision to `APPLIED`.
 
-## Step 5 — Keep the fact-check guardrail (do not skip this)
-
-Resume Matcher optimises for ATS keyword match — it does **not** independently verify that every rewritten line is still literally true against your Career Profile. Before you save the final version, paste the tailored resume back into Ollama with:
-
-```text
-FACT CHECK THIS RESUME.
-
-For EVERY bullet:
-1. Identify the underlying Career Profile fact.
-2. Say DIRECT / REWORDED / INFERRED.
-3. Flag any claim that increases my scope or seniority.
-4. Flag every number, technology, leadership claim and business-impact claim.
-
-Return: FACT CHECK: PASS or FAIL
-If FAIL, list exactly what must be removed or corrected.
-```
-
-Only save the resume to `C:\CareerAI\applications\Company_Role_YYYY-MM-DD\resume.pdf` once you get `PASS`.
-
----
 
 # Part 9 — Track every application (unchanged)
 

@@ -463,16 +463,22 @@ def evaluate_job(job: dict, career_profile: str, job_preferences: str,
 
     breakdown = result.get("score_breakdown", {})
     if breakdown:
+        def _to_int(val, default=0):
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return default
+
         computed = (
-            breakdown.get("base", 50)
-            + breakdown.get("location_fit", 0)
-            + breakdown.get("role_title_fit", 0)
-            + breakdown.get("skills_depth", 0)
-            + breakdown.get("seniority_fit", 0)
-            + breakdown.get("compensation", 0)
-            + breakdown.get("ai_ml_fit", 0)
-            + breakdown.get("red_flags_penalty", 0)
-            + breakdown.get("unknowns_penalty", 0)
+            _to_int(breakdown.get("base"), 50)
+            + _to_int(breakdown.get("location_fit"), 0)
+            + _to_int(breakdown.get("role_title_fit"), 0)
+            + _to_int(breakdown.get("skills_depth"), 0)
+            + _to_int(breakdown.get("seniority_fit"), 0)
+            + _to_int(breakdown.get("compensation"), 0)
+            + _to_int(breakdown.get("ai_ml_fit"), 0)
+            + _to_int(breakdown.get("red_flags_penalty"), 0)
+            + _to_int(breakdown.get("unknowns_penalty"), 0)
         )
         clamped = max(0, min(100, computed))
         if abs(result.get("score", clamped) - clamped) > 5:
@@ -835,7 +841,9 @@ def do_sync_csv(cfg: dict, career_profile: str, job_preferences: str, target_com
                         "company_notes": f"Scoring error: {e}",
                     }
                 
-                print(f"    -> role={verdict.get('score')} ({verdict.get('decision')})")
+                print(f"    -> role={verdict.get('score')} "
+                      f"({verdict.get('decision')})  "
+                      f"company={company_verdict.get('company_score')}")
                 updated_row = {**r, **verdict, **company_verdict}
                 rows[i] = updated_row
                 rewrite_shortlist(csv_path, rows)
