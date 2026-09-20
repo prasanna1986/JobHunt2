@@ -291,9 +291,10 @@ def main():
                 feedback = ""
                 resume_data = None
                 
-                comp_clean = "".join(c if c.isalnum() else "_" for c in job.get('company', 'Company'))
-                title_clean = "".join(c if c.isalnum() else "_" for c in job.get('title', 'Role'))
-                out_folder = APPS_DIR / f"{comp_clean}_{title_clean}"
+                comp_clean = "".join(c if c.isalnum() else "_" for c in job.get('company', 'Company')).strip('_')
+                title_clean = "".join(c if c.isalnum() else "_" for c in job.get('title', 'Role')).strip('_')
+                today_str = time.strftime("%Y-%m-%d")
+                out_folder = APPS_DIR / f"{today_str}_{comp_clean}_{title_clean}"
                 out_folder.mkdir(parents=True, exist_ok=True)
                 
                 while True:
@@ -312,8 +313,8 @@ def main():
                         print("Failed to generate resume data.")
                         break
                         
-                    docx_path = out_folder / "Resume.docx"
-                    pdf_path = out_folder / "Resume.pdf"
+                    docx_path = out_folder / f"Resume_{comp_clean}.docx"
+                    pdf_path = out_folder / f"Resume_{comp_clean}.pdf"
                     
                     try:
                         generate_docx(resume_data, docx_path)
