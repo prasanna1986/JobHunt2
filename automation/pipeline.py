@@ -9,36 +9,13 @@ What this does, end to end, with no manual portal-browsing:
               job postings from LinkedIn, Indeed, ZipRecruiter, Bayt, and
               Google Jobs aggregation in one run.
  2. FILTER  -- drops jobs you've already seen or already applied to.
- 3. STALE   -- checks every APPLY/HOLD job from all previous shortlists
-              against the current scrape. Any that no longer appear are
-              written into today's shortlist with decision="CLOSED".
- 4. SCORE   -- sends each new job, together with your career-profile.md
+ 3. SCORE   -- sends each new job, together with your career-profile.md
               and job-preferences.md, to your local Ollama model and asks
               for a structured APPLY / HOLD / SKIP verdict + rubric score.
- 5. COMPANY -- makes a second, lightweight Ollama call to score the hiring
+ 4. COMPANY -- makes a second, lightweight Ollama call to score the hiring
               company against your company priorities (separate from role fit).
- 6. OUTPUT  -- writes a shortlist CSV + prints a digest. Daily routine =
+ 5. OUTPUT  -- writes a shortlist CSV + prints a digest. Daily routine =
               "open one CSV" instead of "browse job boards".
-
-Nothing here submits an application or messages a recruiter. That step
-stays yours, on purpose (see the SOP for why).
-
-RESUMABLE BY DESIGN
---------------------
-Every job's row is written to today's shortlist CSV, and its URL is marked
-"seen", IMMEDIATELY after it is scored -- not in one batch at the end. If the
-script crashes, loses network, or you Ctrl+C it partway through, nothing
-already-scored is lost. Just run the exact same command again: already-seen
-jobs are skipped instantly and it picks up with whatever's left.
-
-Two additional safety layers:
-  (a) At startup the script also reads all job_url values already present in
-      today's shortlist CSV. Even if seen_jobs.csv missed a write due to an
-      abrupt kill, the shortlist is the authoritative deduplicate source.
-  (b) Stale / closed position detection: after each run you'll see a CLOSED
-      row in today's shortlist for any APPLY/HOLD job from prior days that
-      no longer appears in the current scrape -- so you know immediately to
-      deprioritise it in your outreach.
 
 Requirements
 ------------
@@ -49,11 +26,11 @@ pulled (`ollama pull qwen2.5:14b`).
 
 Usage
 -----
-    python pipeline.py                       # full run (resumes automatically)
-    python pipeline.py --dry-run             # scrape + filter + stale-check; skip AI scoring
-    python pipeline.py --limit 15            # only score the next 15 new jobs
-    python pipeline.py --date 2026-09-13     # force a specific shortlist date (reruns)
-    python pipeline.py --no-stale-check      # skip closed-position detection
+    python pipeline.py                       # full run (scrape + evaluate)
+    python pipeline.py --step scrape         # scrape + filter + cache only
+    python pipeline.py --step evaluate       # evaluate pending cached jobs
+    python pipeline.py --reevaluate all      # rescore all shortlists based on current preferences
+    python pipeline.py --reevaluate 2026-09-18 # rescore a specific shortlist
 """
 
 import argparse
@@ -67,8 +44,7 @@ import time
 from datetime import date
 from pathlib import Path
 
-# Force UTF-8 output so Unicode chars in job descriptions don't crash the
-# Windows console (which defaults to cp1252). Must be set before first print().
+# Force UTF-8 output so Unicode chars in job descriptions don't crash the console
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -82,18 +58,16 @@ try:
 except ImportError:
     sys.exit("python-jobspy is not installed. Run: pip install -U python-jobspy")
 
-# Silence jobspy's per-site INFO/ERROR chatter on stderr.
-# jobspy's create_logger() resets individual logger levels on every scrape
-# call, so setLevel() on named loggers is overridden each time. Instead we
-# attach a filter to the ROOT logger that silently drops every record whose
-# logger name starts with "JobSpy". This is the only reliable suppression
-# point that survives jobspy's internal logger re-initialisation.
+try:
+    import json_repair
+except ImportError:
+    json_repair = None
+
 class _SuppressJobSpy(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return not record.name.startswith("JobSpy")
 
 logging.root.addFilter(_SuppressJobSpy())
-# Also ensure the root handler exists so the filter has something to attach to.
 if not logging.root.handlers:
     logging.root.addHandler(logging.NullHandler())
 
@@ -101,9 +75,13 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 SEEN_JOBS_PATH = HERE / "seen_jobs.csv"
 SHORTLIST_DIR = HERE / "shortlist"
+DATA_DIR = HERE / "data"
 
-# Columns: score + company_score together at front so they sort/filter easily in Excel/Sheets.
-# score_breakdown stays in CSV as a pipe-separated string for full auditability.
+# Ensure data dir exists
+DATA_DIR.mkdir(exist_ok=True)
+JOBS_CACHE_PATH = DATA_DIR / "jobs_cache.jsonl"
+PENDING_EVAL_PATH = DATA_DIR / "pending_eval.jsonl"
+
 SHORTLIST_FIELDNAMES = [
     "score", "company_score", "company_tier",
     "decision", "title", "company", "location", "job_url",
@@ -114,12 +92,6 @@ SHORTLIST_FIELDNAMES = [
 
 # ---------------------------------------------------------------------------
 # ROLE EVALUATION PROMPT
-# ---------------------------------------------------------------------------
-# The rubric forces the model to *construct* a score step-by-step rather than
-# anchor at a comfortable round number like 85. Produces real spread:
-#   * perfect match (Chennai + target title + deep skill match + A-company) -> ~92-95
-#   * partial match (Chennai + OK title + unknown salary)                   -> ~65-70
-#   * mismatch (wrong domain / junior / relocated)                          -> ~15-35
 # ---------------------------------------------------------------------------
 EVAL_INSTRUCTIONS = """You are evaluating a job for a candidate.
 Use ONLY the CAREER PROFILE and JOB PREFERENCES provided as ground truth.
@@ -209,7 +181,6 @@ Respond with ONLY this JSON, no prose, no fences:
 }
 """
 
-
 # ---------------------------------------------------------------------------
 # Config & file helpers
 # ---------------------------------------------------------------------------
@@ -219,7 +190,6 @@ def load_config() -> dict:
         sys.exit(f"Missing {CONFIG_PATH}. Copy config.example.json to config.json first.")
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
-
 def load_text(path_str: str) -> str:
     p = Path(path_str)
     if not p.is_absolute():
@@ -228,9 +198,7 @@ def load_text(path_str: str) -> str:
         sys.exit(f"Required file not found: {p}")
     return p.read_text(encoding="utf-8", errors="ignore")
 
-
 def load_target_companies(path_str: str) -> dict:
-    """Return {company_name_lower: {priority, compensation_potential, ...}}."""
     p = Path(path_str)
     if not p.is_absolute():
         p = (HERE / path_str).resolve()
@@ -249,25 +217,19 @@ def load_target_companies(path_str: str) -> dict:
                 }
     return result
 
-
 def load_seen_job_urls() -> set:
     if not SEEN_JOBS_PATH.exists():
         return set()
     with SEEN_JOBS_PATH.open(newline="", encoding="utf-8") as f:
         return {row["job_url"] for row in csv.DictReader(f) if row.get("job_url")}
 
-
 def mark_job_seen(url: str) -> None:
-    """Append one URL to seen_jobs.csv immediately -- called right after that
-    job's row is safely written to the shortlist, so a crash can never mark
-    a job seen without also having saved its scored result."""
     is_new = not SEEN_JOBS_PATH.exists()
     with SEEN_JOBS_PATH.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if is_new:
             writer.writerow(["job_url", "date_processed"])
         writer.writerow([url, date.today().isoformat()])
-
 
 def load_applied_urls(tracker_path: str) -> set:
     p = Path(tracker_path)
@@ -278,94 +240,54 @@ def load_applied_urls(tracker_path: str) -> set:
     with p.open(newline="", encoding="utf-8") as f:
         return {row.get("JobURL", "") for row in csv.DictReader(f)}
 
-
 # ---------------------------------------------------------------------------
-# Previous shortlist helpers -- for stale / closed-position detection
+# Data Caching Helpers
 # ---------------------------------------------------------------------------
 
-def load_all_previous_shortlists(today_path: Path) -> list[dict]:
-    """Return all APPLY/HOLD rows from every shortlist CSV except today's.
+def save_jobs_to_jsonl(path: Path, jobs: list[dict], append: bool = True) -> None:
+    mode = "a" if append else "w"
+    with path.open(mode, encoding="utf-8") as f:
+        for j in jobs:
+            f.write(json.dumps(j, default=str) + "\n")
 
-    These are jobs the candidate found interesting in prior runs. We'll check
-    whether they're still available in the current scrape and flag any that
-    have disappeared as CLOSED.
-    """
-    watchlist = []
-    for csv_path in sorted(SHORTLIST_DIR.glob("shortlist_*.csv")):
-        if csv_path == today_path:
-            continue
-        with csv_path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                decision = (row.get("decision") or "").strip().upper()
-                url = (row.get("job_url") or "").strip()
-                if decision in ("APPLY", "HOLD") and url:
-                    watchlist.append(row)
-    # Deduplicate by URL (keep most recent occurrence)
-    seen_urls: set = set()
-    deduped = []
-    for row in reversed(watchlist):
-        url = row["job_url"]
-        if url not in seen_urls:
-            seen_urls.add(url)
-            deduped.append(row)
-    return deduped
+def load_jobs_from_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    jobs = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                jobs.append(json.loads(line))
+    return jobs
 
+def load_jobs_cache_as_dict(path: Path) -> dict:
+    """Returns {job_url: job_dict} for O(1) lookup."""
+    cache = {}
+    for j in load_jobs_from_jsonl(path):
+        url = j.get("job_url")
+        if url:
+            cache[url] = j
+    return cache
 
-def find_closed_positions(watchlist: list[dict], scraped_urls: set,
-                          already_in_today: set) -> list[dict]:
-    """Return watchlist rows whose URL did NOT appear in the current scrape
-    and has NOT already been written to today's shortlist as CLOSED.
-
-    A job that disappears from scrape results is almost certainly filled,
-    expired, or delisted -- worth surfacing so the candidate can deprioritise
-    any pending outreach.
-    """
-    closed = []
-    for row in watchlist:
-        url = row["job_url"]
-        if url not in scraped_urls and url not in already_in_today:
-            closed.append(row)
-    return closed
-
+def pop_pending_job(path: Path) -> dict | None:
+    """Reads the first job, rewrites the file without it, returns the job."""
+    jobs = load_jobs_from_jsonl(path)
+    if not jobs:
+        return None
+    job = jobs.pop(0)
+    save_jobs_to_jsonl(path, jobs, append=False)
+    return job
 
 # ---------------------------------------------------------------------------
 # Job scraping -- with smart retry / error classification
 # ---------------------------------------------------------------------------
 
-# Status codes that are permanent blocks -- no point retrying, the site won't
-# suddenly change its mind. Log once and move on.
-_PERMANENT_BLOCK_CODES: frozenset[int] = frozenset({
-    400,  # Bad request -- usually bad search params or an anti-bot page
-    401,  # Unauthorized
-    403,  # Forbidden -- site is blocking the scraper (e.g. Glassdoor)
-    404,  # Not found
-    406,  # Not Acceptable -- Naukri's captcha / RECAPTCHA wall
-    407,  # Proxy authentication required
-    451,  # Unavailable for legal reasons
-})
-
-# Status codes where backing off and retrying is appropriate
-_RETRYABLE_CODES: frozenset[int] = frozenset({
-    429,  # Too Many Requests -- rate-limited; needs a longer sleep
-    500,  # Internal Server Error -- transient server fault
-    502,  # Bad Gateway -- transient proxy/CDN fault
-    503,  # Service Unavailable -- server overloaded or in maintenance
-    504,  # Gateway Timeout -- transient upstream timeout
-    524,  # Cloudflare timeout (seen on some job boards)
-})
-
+_PERMANENT_BLOCK_CODES: frozenset[int] = frozenset({400, 401, 403, 404, 406, 407, 451})
+_RETRYABLE_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 524})
 
 def _extract_status_code(exc: Exception) -> int | None:
-    """Try to parse an HTTP status code from an exception message.
-
-    jobspy catches HTTP errors internally and raises them with messages like:
-      "Glassdoor response status code 400"
-      "Glassdoor: bad response status code: 403"
-      "status_code=429"
-    We fish out the 3-digit code so we can classify the failure.
-    """
     msg = str(exc)
-    # Look for any 3-digit sequence that plausibly is an HTTP code (2xx-5xx)
     matches = re.findall(r"\b([2-5]\d{2})\b", msg)
     for m in matches:
         code = int(m)
@@ -373,17 +295,7 @@ def _extract_status_code(exc: Exception) -> int | None:
             return code
     return None
 
-
 def _is_retryable(exc: Exception) -> tuple[bool, int | None]:
-    """Return (should_retry, http_status_code_or_None).
-
-    Decision table:
-      * 429 / 5xx          -> retry (transient)
-      * 4xx (not 429)      -> don't retry (permanent block)
-      * ConnectionError    -> retry (network blip)
-      * Timeout            -> retry (server slow, try again)
-      * Unknown exception  -> retry once (give benefit of the doubt)
-    """
     code = _extract_status_code(exc)
     if code is not None:
         if code in _RETRYABLE_CODES:
@@ -391,48 +303,23 @@ def _is_retryable(exc: Exception) -> tuple[bool, int | None]:
         if code in _PERMANENT_BLOCK_CODES:
             return False, code
         if 400 <= code < 500:
-            # Uncategorised 4xx -> permanent, don't retry
             return False, code
         if 500 <= code < 600:
-            # Uncategorised 5xx -> transient, retry
             return True, code
-
-    # No status code found -- check exception type by name
     exc_type = type(exc).__name__.lower()
     if any(t in exc_type for t in ("connection", "timeout", "reset", "eof")):
         return True, None
     msg_lower = str(exc).lower()
     if any(t in msg_lower for t in ("connection", "timeout", "network", "reset", "eof")):
         return True, None
-
-    # Unknown -- be optimistic and allow one retry
     return True, None
 
-
 def _backoff_seconds(attempt: int, code: int | None) -> float:
-    """Return how many seconds to wait before the next attempt.
-
-    * 429 (rate-limit): start at 60s, double each attempt (60->120->240)
-    * 5xx / network:    start at 10s, double each attempt (10->20->40)
-    """
     if code == 429:
-        return 60.0 * (2 ** (attempt - 1))   # 60, 120, 240
-    return 10.0 * (2 ** (attempt - 1))        # 10, 20, 40
+        return 60.0 * (2 ** (attempt - 1))
+    return 10.0 * (2 ** (attempt - 1))
 
-
-def _scrape_one(cfg: dict, max_retries: int = 2) -> "pd.DataFrame | None":
-    """Scrape a single search config with retry logic.
-
-    Returns a DataFrame (possibly empty) on success, or None if the search
-    failed permanently and should be skipped entirely.
-
-    Retry policy:
-      * retryable errors (429, 5xx, network) -> retry up to max_retries times
-        with exponential backoff
-      * permanent errors (4xx except 429)    -> log once, return None immediately
-      * empty result (0 jobs)                -> NOT retried; the site just has
-        no matches right now, which is a valid answer
-    """
+def _scrape_one(cfg: dict, max_retries: int = 2):
     sites = cfg.get("site_name", ["linkedin", "indeed"])
     is_google_only = sites == ["google"] or sites == "google"
     search_term = (
@@ -450,93 +337,105 @@ def _scrape_one(cfg: dict, max_retries: int = 2) -> "pd.DataFrame | None":
         linkedin_fetch_description=True,
     )
 
-    last_exc: Exception | None = None
-    for attempt in range(1, max_retries + 2):   # attempts: 1 ... max_retries+1
+    for attempt in range(1, max_retries + 2):
         try:
             return scrape_jobs(**kwargs)
-
         except Exception as exc:
-            last_exc = exc
             retryable, code = _is_retryable(exc)
-
             if not retryable:
-                # Permanent block -- log with clear reason, don't retry
                 reason = f"HTTP {code}" if code else "permanent error"
                 print(f"    [FAIL] {reason} (no retry): {exc}")
                 return None
-
             if attempt > max_retries:
-                # Exhausted retries
                 reason = f"HTTP {code}" if code else type(exc).__name__
                 print(f"    [FAIL] Failed after {max_retries} retries ({reason}): {exc}")
                 return None
-
-            # Retryable -- back off and try again
             wait = _backoff_seconds(attempt, code)
             reason = f"HTTP {code}" if code else type(exc).__name__
             print(f"    [retry] Attempt {attempt} failed ({reason}). "
                   f"Retrying in {wait:.0f}s... [{exc}]")
             time.sleep(wait)
-
-    return None  # unreachable, but satisfies type checker
-
+    return None
 
 def scrape_all(search_configs, max_retries: int = 2) -> list:
-    """Run all configured searches and return a deduplicated list of job dicts.
-
-    Each search gets up to max_retries extra attempts on transient failures.
-    Permanent blocks (403, 400, etc.) are skipped immediately without retry.
-    """
     import pandas as pd
-
     frames = []
     for cfg in search_configs:
         sites = cfg.get("site_name", ["linkedin", "indeed"])
         print(f"  scraping: {cfg['search_term']!r} @ {cfg['location']!r} on {sites}")
-
         df = _scrape_one(cfg, max_retries=max_retries)
-
         if df is None:
-            # Permanent failure already logged by _scrape_one
             pass
         elif df.empty:
             print(f"    -> 0 results")
         else:
             frames.append(df)
             print(f"    -> {len(df)} results")
-
-        time.sleep(2)  # polite pause between searches regardless of outcome
-
-
+        time.sleep(2)
     if not frames:
         return []
     combined = pd.concat(frames, ignore_index=True)
+    # Fill NaN with empty string to avoid JSON serialisation errors
+    combined = combined.fillna("")
     combined = combined.drop_duplicates(subset=["job_url"])
     return combined.to_dict(orient="records")
-
 
 # ---------------------------------------------------------------------------
 # Ollama calls
 # ---------------------------------------------------------------------------
 
-def call_ollama(model: str, url: str, prompt: str, timeout: int | None = None) -> dict:
-    try:
-        resp = requests.post(
-            url,
-            json={"model": model, "prompt": prompt, "stream": False, "format": "json"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        raw = resp.json().get("response", "{}")
-        return json.loads(raw)
-    except (requests.RequestException, json.JSONDecodeError) as e:
-        print(f"    ! Ollama call failed: {e}")
-        return {}
-
+def call_ollama(model: str, url: str, prompt: str, timeout: int | None = None, retries: int = 2) -> dict:
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(
+                url,
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 3000
+                    },
+                    "think": False,
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            raw = (resp.json().get("response") or "").strip()
+            
+            if not raw:
+                if attempt < retries:
+                    print(f"    ! Ollama returned an empty response, retrying ({attempt+1}/{retries})...")
+                    time.sleep(1)
+                    continue
+                print("    ! Ollama returned an empty response")
+                return {}
+                
+            # Robust JSON extraction to handle conversational fluff or markdown
+            start_idx = raw.find('{')
+            end_idx = raw.rfind('}')
+            if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+                raw = raw[start_idx:end_idx+1]
+            
+            if json_repair:
+                parsed = json_repair.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            
+            return json.loads(raw)
+            
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            if attempt < retries:
+                print(f"    ! Ollama call failed ({e}), retrying ({attempt+1}/{retries})...")
+                time.sleep(2)
+                continue
+            print(f"    ! Ollama call failed after {retries} retries: {e}")
+            return {}
 
 def evaluate_job(job: dict, career_profile: str, job_preferences: str,
                  model: str, ollama_url: str, timeout: int | None = None) -> dict:
-    """Score the role fit. Returns the model's parsed JSON dict with rubric enforcement."""
     description = (job.get("description") or "")[:3500]
     prompt = (
         f"{EVAL_INSTRUCTIONS}\n\n"
@@ -562,7 +461,6 @@ def evaluate_job(job: dict, career_profile: str, job_preferences: str,
             },
         }
 
-    # Enforce the rubric: recompute score from breakdown if model drifted.
     breakdown = result.get("score_breakdown", {})
     if breakdown:
         computed = (
@@ -577,20 +475,16 @@ def evaluate_job(job: dict, career_profile: str, job_preferences: str,
             + breakdown.get("unknowns_penalty", 0)
         )
         clamped = max(0, min(100, computed))
-        # Override the stated score if it deviates by more than 5 from the rubric sum.
         if abs(result.get("score", clamped) - clamped) > 5:
             result["score"] = clamped
 
     return result
 
-
 def evaluate_company(job: dict, job_preferences: str, target_companies: dict,
                      model: str, ollama_url: str, timeout: int | None = None) -> dict:
-    """Score the hiring company separately from role fit."""
     company_name = (job.get("company") or "").strip()
     description_snippet = (job.get("description") or "")[:1500]
 
-    # Quick authoritative lookup from target-companies.csv
     lookup = target_companies.get(company_name.lower(), {})
     lookup_hint = ""
     if lookup:
@@ -609,9 +503,8 @@ def evaluate_company(job: dict, job_preferences: str, target_companies: dict,
         f"{lookup_hint}\n"
         f"COMPANY PREFERENCES:\n{job_preferences}\n"
     )
-    result = call_ollama(model, ollama_url, prompt, timeout=company_timeout)
+    result = call_ollama(model, ollama_url, prompt, timeout=timeout)
     if not result:
-        # Fallback: derive directly from CSV priority without a model call
         if lookup:
             tier = lookup.get("priority", "UNKNOWN")
             base_score = 82 if tier == "A" else (70 if tier == "B" else 50)
@@ -627,7 +520,6 @@ def evaluate_company(job: dict, job_preferences: str, target_companies: dict,
             "company_notes": "Could not evaluate -- model returned no output.",
         }
 
-    # If we have authoritative CSV data, override model's tier and floor the score
     if lookup and lookup.get("priority") in ("A", "B"):
         result["company_tier"] = lookup["priority"]
         if lookup["priority"] == "A":
@@ -637,29 +529,23 @@ def evaluate_company(job: dict, job_preferences: str, target_companies: dict,
 
     return result
 
-
 # ---------------------------------------------------------------------------
 # Shortlist I/O
 # ---------------------------------------------------------------------------
 
-def get_shortlist_path(run_date: date) -> Path:
-    return SHORTLIST_DIR / f"shortlist_{run_date.isoformat()}.csv"
-
+def get_shortlist_path() -> Path:
+    return SHORTLIST_DIR / "shortlist.csv"
 
 def ensure_shortlist_header(path: Path) -> None:
     if not path.exists():
         with path.open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=SHORTLIST_FIELDNAMES).writeheader()
 
-
 def append_shortlist_row(path: Path, row: dict) -> None:
-    """Write one scored job to disk immediately (one open+close per row).
-    Every completed job is guaranteed on disk before we move to the next one."""
     flat = dict(row)
     for k in ("top_reasons", "red_flags", "missing_information"):
         if isinstance(flat.get(k), list):
             flat[k] = " | ".join(flat[k])
-    # Serialise score_breakdown dict -> compact pipe-separated string for CSV readability
     if isinstance(flat.get("score_breakdown"), dict):
         bd = flat["score_breakdown"]
         flat["score_breakdown"] = " | ".join(f"{k}={v}" for k, v in bd.items())
@@ -667,71 +553,42 @@ def append_shortlist_row(path: Path, row: dict) -> None:
         writer = csv.DictWriter(f, fieldnames=SHORTLIST_FIELDNAMES, extrasaction="ignore")
         writer.writerow(flat)
 
-
 def read_shortlist_rows(path: Path) -> list:
     if not path.exists():
         return []
     with path.open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
-
 def load_shortlist_job_urls(path: Path) -> set:
-    """Return job_url values already in this shortlist file.
-    Crash-safe dedup: even if seen_jobs.csv missed a write, we won't
-    re-score or double-write a row that's already on disk."""
     return {r["job_url"] for r in read_shortlist_rows(path) if r.get("job_url")}
 
+def rewrite_shortlist(path: Path, rows: list[dict]) -> None:
+    """Overwrites the shortlist file entirely."""
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SHORTLIST_FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            flat = dict(row)
+            for k in ("top_reasons", "red_flags", "missing_information"):
+                if isinstance(flat.get(k), list):
+                    flat[k] = " | ".join(flat[k])
+            if isinstance(flat.get("score_breakdown"), dict):
+                bd = flat["score_breakdown"]
+                flat["score_breakdown"] = " | ".join(f"{k}={v}" for k, v in bd.items())
+            writer.writerow(flat)
+
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Execution Blocks
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="CareerAI pipeline -- scrape, score, and track job postings.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="scrape + filter + stale-check only, skip AI scoring")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="max number of new jobs to score this run")
-    parser.add_argument("--date", type=str, default=None,
-                        help="YYYY-MM-DD -- force a specific shortlist date (reruns next morning)")
-    parser.add_argument("--no-stale-check", action="store_true",
-                        help="skip closed-position detection from previous shortlists")
-    args = parser.parse_args()
-
-    cfg = load_config()
-    SHORTLIST_DIR.mkdir(exist_ok=True)
-
-    # Determine the shortlist date once at startup (midnight-safe)
-    if args.date:
-        try:
-            run_date = date.fromisoformat(args.date)
-        except ValueError:
-            sys.exit(f"--date must be YYYY-MM-DD, got: {args.date!r}")
-    else:
-        run_date = date.today()
-
-    out_path = get_shortlist_path(run_date)
-
-    print("Loading career profile and preferences...")
-    career_profile = load_text(cfg["career_profile_path"])
-    job_preferences = load_text(cfg["job_preferences_path"])
-
-    print("Loading target companies list...")
-    companies_path = cfg.get("target_companies_path", "../profile/target-companies.csv")
-    target_companies = load_target_companies(companies_path)
-    print(f"  {len(target_companies)} companies loaded from priority list")
-
+def do_scrape(cfg: dict, out_path: Path):
     print("Loading history (already-seen and already-applied jobs)...")
     seen = load_seen_job_urls()
     applied = load_applied_urls(cfg.get("tracker_path", "../tracker/applications.csv"))
-
-    # CRASH-SAFE DEDUP: also read URLs already in today's shortlist.
-    # Prevents re-scoring + double-writing if seen_jobs.csv missed a write on abrupt kill.
     already_shortlisted = load_shortlist_job_urls(out_path)
     if already_shortlisted:
-        print(f"  {len(already_shortlisted)} job(s) already in today's shortlist "
-              f"(resume layer -- will not re-score)")
+        print(f"  {len(already_shortlisted)} job(s) already in today's shortlist")
 
     skip_urls = seen | applied | already_shortlisted
 
@@ -740,126 +597,269 @@ def main():
     jobs = scrape_all(cfg["searches"], max_retries=max_retries)
     print(f"  {len(jobs)} unique postings scraped across all boards")
 
-    # Build the set of all scraped URLs for stale-position detection
-    scraped_urls: set = {j["job_url"] for j in jobs if j.get("job_url")}
-
     new_jobs = [j for j in jobs if j.get("job_url") and j["job_url"] not in skip_urls]
     print(f"  {len(new_jobs)} are new (not previously seen or applied to)")
 
-    if args.limit:
-        new_jobs = new_jobs[: args.limit]
+    if new_jobs:
+        print("Caching new job data...")
+        save_jobs_to_jsonl(JOBS_CACHE_PATH, new_jobs, append=True)
+        save_jobs_to_jsonl(PENDING_EVAL_PATH, new_jobs, append=True)
+    return new_jobs
 
-    # -- STALE / CLOSED POSITION DETECTION ----------------------------------
-    closed_rows: list[dict] = []
-    if not args.no_stale_check:
-        print("\nChecking previous shortlists for closed/delisted positions...")
-        watchlist = load_all_previous_shortlists(out_path)
-        if watchlist:
-            closed_rows = find_closed_positions(watchlist, scraped_urls, already_shortlisted)
-            if closed_rows:
-                print(f"  {len(closed_rows)} previously shortlisted job(s) no longer "
-                      f"appear in today's scrape -> will mark CLOSED")
-            else:
-                print(f"  all {len(watchlist)} previously shortlisted job(s) still active")
-        else:
-            print("  no previous shortlists found")
-    # -----------------------------------------------------------------------
 
-    if args.dry_run:
-        print(f"\n-- New jobs (dry-run, not scored) --")
-        for j in new_jobs:
-            print(f"  [NOT SCORED] {j.get('title')} @ {j.get('company')} -- {j.get('job_url')}")
-        if closed_rows:
-            print(f"\n-- Closed positions --")
-            for r in closed_rows:
-                print(f"  [CLOSED] {r.get('title')} @ {r.get('company')} -- {r.get('job_url')}")
-    else:
-        ensure_shortlist_header(out_path)
-        model = cfg.get("ollama_model", "qwen2.5:14b")
-        ollama_url = cfg.get("ollama_url", "http://localhost:11434/api/generate")
-        # Timeouts: None means wait forever (correct for slow local models).
-        # Set ollama_timeout_role / ollama_timeout_company in config.json to an
-        # integer (seconds) only if you need a hard cap. 0 or null = no timeout.
-        def _parse_timeout(val) -> int | None:
-            """Return None for falsy values (0, null/None) meaning no timeout."""
-            if val is None or val == 0:
-                return None
-            return int(val)
-        role_timeout    = _parse_timeout(cfg.get("ollama_timeout_role"))
-        company_timeout = _parse_timeout(cfg.get("ollama_timeout_company"))
+def do_evaluate(cfg: dict, out_path: Path, career_profile: str, job_preferences: str, target_companies: dict, role_timeout: int|None, company_timeout: int|None):
+    pending_jobs = load_jobs_from_jsonl(PENDING_EVAL_PATH)
+    if not pending_jobs:
+        print("No pending jobs to evaluate.")
+        return
 
-        # -- Write CLOSED rows first (no Ollama needed) ----------------------
-        if closed_rows:
-            print(f"\nWriting {len(closed_rows)} CLOSED position(s) to today's shortlist...")
-            for r in closed_rows:
-                closed_row = {
-                    "score": r.get("score", ""),
-                    "company_score": r.get("company_score", ""),
-                    "company_tier": r.get("company_tier", ""),
-                    "decision": "CLOSED",
-                    "title": r.get("title", ""),
-                    "company": r.get("company", ""),
-                    "location": r.get("location", ""),
-                    "job_url": r.get("job_url", ""),
-                    "min_amount": r.get("min_amount", ""),
-                    "max_amount": r.get("max_amount", ""),
-                    "currency": r.get("currency", ""),
-                    "site": r.get("site", ""),
-                    "top_reasons": "Position no longer appears in current scrape -- likely filled or delisted.",
-                    "red_flags": r.get("red_flags", ""),
-                    "missing_information": r.get("missing_information", ""),
-                    "company_notes": r.get("company_notes", ""),
-                    "score_breakdown": r.get("score_breakdown", ""),
+    ensure_shortlist_header(out_path)
+    model = cfg.get("ollama_model", "qwen2.5:14b")
+    ollama_url = cfg.get("ollama_url", "http://localhost:11434/api/generate")
+
+    print(f"\nScoring {len(pending_jobs)} pending job(s)...")
+    scored_this_run = 0
+
+    try:
+        while True:
+            # Pop job one by one so crashes don't lose the queue
+            j = pop_pending_job(PENDING_EVAL_PATH)
+            if not j:
+                break
+            
+            print(f"  [{scored_this_run+1}] {j.get('title')} @ {j.get('company')}")
+            try:
+                verdict = evaluate_job(
+                    j, career_profile, job_preferences, model, ollama_url,
+                    timeout=role_timeout)
+            except Exception as e:
+                print(f"    ! role scoring failed, re-queueing ({e})")
+                # Put back in queue at front
+                existing = load_jobs_from_jsonl(PENDING_EVAL_PATH)
+                save_jobs_to_jsonl(PENDING_EVAL_PATH, [j] + existing, append=False)
+                break
+
+            try:
+                company_verdict = evaluate_company(
+                    j, job_preferences, target_companies, model, ollama_url,
+                    timeout=company_timeout)
+            except Exception as e:
+                print(f"    ! company scoring failed, using fallback ({e})")
+                company_verdict = {
+                    "company_score": 50, "company_tier": "UNKNOWN",
+                    "company_notes": f"Scoring error: {e}",
                 }
-                append_shortlist_row(out_path, closed_row)
-                # Mark as seen so we don't keep re-checking this URL
-                mark_job_seen(r["job_url"])
-        # --------------------------------------------------------------------
 
-        # -- Score new jobs ---------------------------------------------------
-        scored_this_run = 0
-        if new_jobs:
-            print(f"\nScoring {len(new_jobs)} new job(s)...")
-        try:
-            for i, j in enumerate(new_jobs, 1):
-                print(f"  [{i}/{len(new_jobs)}] {j.get('title')} @ {j.get('company')}")
+            print(f"    -> role={verdict.get('score')} "
+                  f"({verdict.get('decision')})  "
+                  f"company={company_verdict.get('company_score')}")
+
+            append_shortlist_row(out_path, {**j, **verdict, **company_verdict})
+            mark_job_seen(j["job_url"])
+            scored_this_run += 1
+
+    except KeyboardInterrupt:
+        print(f"\nStopped early. {scored_this_run} job(s) scored and saved "
+              f"to {out_path.name} before you stopped.")
+        print("Run the same command again to continue -- nothing is lost.")
+        sys.exit(0)
+
+def do_reevaluate(cfg: dict, targets: list, career_profile: str, job_preferences: str, target_companies: dict, role_timeout: int|None, company_timeout: int|None):
+    """Reevaluates jobs in shortlists using their cached descriptions."""
+    print("Loading job cache...")
+    cache = load_jobs_cache_as_dict(JOBS_CACHE_PATH)
+    if not cache:
+        print("  ! Job cache is empty. Cannot reevaluate without descriptions.")
+        return
+
+    target_urls = set()
+    csvs_to_process = set()
+    evaluate_all_in_csv = False
+
+    for t in targets:
+        if t.lower() == "all":
+            evaluate_all_in_csv = True
+            csvs_to_process.add(get_shortlist_path())
+        else:
+            try:
+                target_date = date.fromisoformat(t)
+                p = get_shortlist_path()
+                if p.exists():
+                    csvs_to_process.add(p)
+                    evaluate_all_in_csv = True
+            except ValueError:
+                target_urls.add(t)
+                
+    if target_urls and not evaluate_all_in_csv:
+        csvs_to_process.add(get_shortlist_path())
+
+    if not csvs_to_process:
+        print("No shortlists found to reevaluate.")
+        return
+        
+    csvs_to_process = sorted(list(csvs_to_process))
+
+    model = cfg.get("ollama_model", "qwen2.5:14b")
+    ollama_url = cfg.get("ollama_url", "http://localhost:11434/api/generate")
+
+    for csv_path in csvs_to_process:
+        print(f"\nReevaluating {csv_path.name}...")
+        rows = read_shortlist_rows(csv_path)
+        updated_rows = []
+        rewrote_any = False
+        for r in rows:
+            url = r.get("job_url")
+            
+            # If we're looking for specific URLs and this isn't one, skip evaluation
+            if target_urls and not evaluate_all_in_csv and url not in target_urls:
+                updated_rows.append(r)
+                continue
+                
+            if not url or url not in cache:
+                print(f"  [SKIP] Job description not in cache: {r.get('title')} @ {r.get('company')}")
+                updated_rows.append(r)
+                continue
+            
+            job = cache[url]
+            print(f"  [RE-SCORE] {job.get('title')} @ {job.get('company')}")
+            rewrote_any = True
+            
+            try:
+                verdict = evaluate_job(
+                    job, career_profile, job_preferences, model, ollama_url,
+                    timeout=role_timeout)
+            except Exception as e:
+                print(f"    ! role scoring failed ({e}), keeping old score.")
+                updated_rows.append(r)
+                continue
+                
+            try:
+                company_verdict = evaluate_company(
+                    job, job_preferences, target_companies, model, ollama_url,
+                    timeout=company_timeout)
+            except Exception as e:
+                print(f"    ! company scoring failed ({e}), using fallback.")
+                company_verdict = {
+                    "company_score": 50, "company_tier": "UNKNOWN",
+                    "company_notes": f"Scoring error: {e}",
+                }
+            
+            print(f"    -> role={verdict.get('score')} "
+                  f"({verdict.get('decision')})  "
+                  f"company={company_verdict.get('company_score')}")
+            
+            updated_row = {**r, **verdict, **company_verdict}
+            updated_rows.append(updated_row)
+        
+        # Only rewrite the CSV if we actually reevaluated something
+        if not evaluate_all_in_csv and not rewrote_any:
+            continue
+            
+        print(f"Writing updated {csv_path.name}...")
+        rewrite_shortlist(csv_path, updated_rows)
+
+    print("\nReevaluation complete.")
+
+def check_if_open(url: str) -> bool:
+    """Returns True if the job appears open, False if it appears closed."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 404:
+            return False
+            
+        text = resp.text.lower()
+        if "no longer accepting applications" in text:
+            return False
+        if "this job is closed" in text:
+            return False
+        if "no longer available" in text:
+            return False
+            
+        return True
+    except Exception as e:
+        print(f"    ! Error checking URL {url}: {e}")
+        return True # Default to open if we can't tell
+
+def do_sync_csv(cfg: dict, career_profile: str, job_preferences: str, target_companies: dict, role_timeout: int|None, company_timeout: int|None):
+    """Scans shortlists for REEVALUATE or CHECK decisions and processes them."""
+    print("Scanning shortlists for REEVALUATE or CHECK markers...")
+    
+    cache = load_jobs_cache_as_dict(JOBS_CACHE_PATH)
+    if not cache:
+        print("  ! Job cache is empty. Will not be able to reevaluate jobs.")
+    
+    model = cfg.get("ollama_model", "qwen2.5:14b")
+    ollama_url = cfg.get("ollama_url", "http://localhost:11434/api/generate")
+
+    csvs = [get_shortlist_path()]
+    
+    for csv_path in csvs:
+        rows = read_shortlist_rows(csv_path)
+        
+        for i, r in enumerate(rows):
+            decision = (r.get("decision") or "").strip().upper()
+            url = r.get("job_url")
+            
+            if decision == "REEVALUATE":
+                if not url or url not in cache:
+                    print(f"  [SKIP REEVALUATE] Description not in cache: {r.get('title')} @ {r.get('company')}")
+                    # Revert to a safe decision so it doesn't get stuck in a REEVALUATE loop
+                    rows[i]["decision"] = "HOLD" 
+                    rewrite_shortlist(csv_path, rows)
+                    continue
+                
+                job = cache[url]
+                print(f"  [RE-SCORE] {job.get('title')} @ {job.get('company')}")
+                
                 try:
                     verdict = evaluate_job(
-                        j, career_profile, job_preferences, model, ollama_url,
+                        job, career_profile, job_preferences, model, ollama_url,
                         timeout=role_timeout)
                 except Exception as e:
-                    # Don't mark as seen -- leave it to be retried on the next run.
-                    print(f"    ! role scoring failed, will retry next run ({e})")
+                    print(f"    ! role scoring failed ({e}), keeping old score.")
+                    rows[i]["decision"] = "HOLD"
+                    rewrite_shortlist(csv_path, rows)
                     continue
-
-                # Company score -- non-fatal; defaults gracefully
+                    
                 try:
                     company_verdict = evaluate_company(
-                        j, job_preferences, target_companies, model, ollama_url,
+                        job, job_preferences, target_companies, model, ollama_url,
                         timeout=company_timeout)
                 except Exception as e:
-                    print(f"    ! company scoring failed, using fallback ({e})")
+                    print(f"    ! company scoring failed ({e}), using fallback.")
                     company_verdict = {
                         "company_score": 50, "company_tier": "UNKNOWN",
                         "company_notes": f"Scoring error: {e}",
                     }
+                
+                print(f"    -> role={verdict.get('score')} ({verdict.get('decision')})")
+                updated_row = {**r, **verdict, **company_verdict}
+                rows[i] = updated_row
+                rewrite_shortlist(csv_path, rows)
+                
+            elif decision == "CHECK":
+                if not url:
+                    rows[i]["decision"] = "HOLD"
+                    rewrite_shortlist(csv_path, rows)
+                    continue
+                    
+                print(f"  [CHECK OPEN] {r.get('title')} @ {r.get('company')}")
+                is_open = check_if_open(url)
+                if is_open:
+                    print("    -> Appears OPEN (changed decision to HOLD)")
+                    rows[i]["decision"] = "HOLD"
+                else:
+                    print("    -> Appears CLOSED (changed decision to CLOSED)")
+                    rows[i]["decision"] = "CLOSED"
+                    
+                rewrite_shortlist(csv_path, rows)
 
-                print(f"    -> role={verdict.get('score')} "
-                      f"({verdict.get('decision')})  "
-                      f"company={company_verdict.get('company_score')}")
+    print("CSV sync complete.")
 
-                append_shortlist_row(out_path, {**j, **verdict, **company_verdict})
-                mark_job_seen(j["job_url"])
-                scored_this_run += 1
-
-        except KeyboardInterrupt:
-            print(f"\nStopped early. {scored_this_run} job(s) scored and saved "
-                  f"to {out_path.name} before you stopped.")
-            print("Run the same command again to continue -- nothing is lost.")
-            sys.exit(0)
-        # --------------------------------------------------------------------
-
-    # -- Summary digest -------------------------------------------------------
+def display_summary(out_path: Path, cfg: dict):
     rows = read_shortlist_rows(out_path)
     min_score = cfg.get("min_score_to_show", 60)
 
@@ -870,7 +870,6 @@ def main():
             return 0
 
     def sort_key(r):
-        # CLOSED rows go at the bottom; everything else sorts by score descending
         decision = (r.get("decision") or "").upper()
         return (0 if decision == "CLOSED" else 1, score_of(r))
 
@@ -878,7 +877,7 @@ def main():
 
     print(f"\n{'-'*60}")
     print(f"Today's shortlist: {out_path}")
-    print(f"{len(rows)} row(s) total | showing score >= {min_score} and CLOSED\n")
+    print(f"{len(rows)} row(s) total | showing score >= {min_score}\n")
 
     apply_rows = [r for r in rows if (r.get("decision") or "").upper() == "APPLY"
                   and score_of(r) >= min_score]
@@ -886,7 +885,6 @@ def main():
                   and score_of(r) >= min_score]
     skip_rows  = [r for r in rows if (r.get("decision") or "").upper() == "SKIP"
                   and score_of(r) >= min_score]
-    closed_display = [r for r in rows if (r.get("decision") or "").upper() == "CLOSED"]
 
     def print_rows(label, group):
         if not group:
@@ -903,10 +901,65 @@ def main():
     print_rows("APPLY", apply_rows)
     print_rows("HOLD",  hold_rows)
     print_rows("SKIP",  skip_rows)
-    print_rows("CLOSED -- no longer in today's scrape", closed_display)
 
-    if not any([apply_rows, hold_rows, skip_rows, closed_display]) and not args.dry_run:
+    if not any([apply_rows, hold_rows, skip_rows]):
         print("  (nothing to show yet)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CareerAI pipeline -- scrape, score, and track job postings.")
+    parser.add_argument("--step", choices=["scrape", "evaluate", "full"], default="full",
+                        help="Run only a specific step of the pipeline.")
+    parser.add_argument("--reevaluate", nargs="+", default=None,
+                        help="Reevaluate past jobs. Pass 'all', dates (YYYY-MM-DD), or specific job URLs.")
+    parser.add_argument("--sync-csv", action="store_true",
+                        help="Scan all shortlists for rows with decision=REEVALUATE or CHECK and process them.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="max number of new jobs to score this run (deprecated, use steps instead)")
+    parser.add_argument("--date", type=str, default=None,
+                        help="YYYY-MM-DD -- force a specific shortlist date (reruns next morning)")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    SHORTLIST_DIR.mkdir(exist_ok=True)
+
+    if args.date:
+        print(f"Warning: --date is deprecated. All data is now written to shortlist.csv.")
+
+    out_path = get_shortlist_path()
+
+    print("Loading career profile and preferences...")
+    career_profile = load_text(cfg["career_profile_path"])
+    job_preferences = load_text(cfg["job_preferences_path"])
+
+    print("Loading target companies list...")
+    companies_path = cfg.get("target_companies_path", "../profile/target-companies.csv")
+    target_companies = load_target_companies(companies_path)
+    print(f"  {len(target_companies)} companies loaded from priority list")
+
+    def _parse_timeout(val) -> int | None:
+        if val is None or val == 0:
+            return None
+        return int(val)
+    role_timeout    = _parse_timeout(cfg.get("ollama_timeout_role"))
+    company_timeout = _parse_timeout(cfg.get("ollama_timeout_company"))
+
+    if args.sync_csv:
+        do_sync_csv(cfg, career_profile, job_preferences, target_companies, role_timeout, company_timeout)
+        return
+
+    if args.reevaluate:
+        do_reevaluate(cfg, args.reevaluate, career_profile, job_preferences, target_companies, role_timeout, company_timeout)
+        return
+
+    if args.step in ["scrape", "full"]:
+        do_scrape(cfg, out_path)
+
+    if args.step in ["evaluate", "full"]:
+        do_evaluate(cfg, out_path, career_profile, job_preferences, target_companies, role_timeout, company_timeout)
+
+    display_summary(out_path, cfg)
 
 
 if __name__ == "__main__":

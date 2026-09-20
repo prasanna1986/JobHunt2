@@ -10,8 +10,8 @@ v4 hardens and extends that same pipeline without changing the daily routine:
 | **Scoring spread** | Old pipeline anchored at score 85 for every APPLY job. New rubric-based prompt forces the model to construct the score from weighted axes, producing real spread (e.g. 92 for a perfect Chennai + target-title + A-company match vs 62 for a borderline role with unknown salary). |
 | **Score breakdown in CSV** | Every row now includes a `score_breakdown` column (`base=50 \| location_fit=15 \| ...`) so you can see exactly why a job scored what it did. |
 | **Company score column** | A separate Ollama call rates the *hiring company* (0–100, tier A/B/UNKNOWN) independent of role fit. Your `target-companies.csv` is now read at startup and used to anchor the company score for known priority companies. |
-| **Closed-position detection** | At the start of every run, APPLY/HOLD jobs from all previous shortlists are checked against the current scrape. Any that no longer appear are written into today's shortlist with `decision=CLOSED` — so you know immediately which roles to deprioritise in outreach. |
-| **Resume capability** | If a run is interrupted (crash, Ctrl+C, power loss), re-running the same command picks up exactly where it left off. Two safety layers: `seen_jobs.csv` + a secondary check against today's shortlist CSV so a job is never re-scored even if `seen_jobs.csv` missed a write. |
+| **Job Cache & Reevaluation** | Full job descriptions are now securely cached in `automation/data/jobs_cache.jsonl` upon scraping. This allows you to reevaluate past shortlists using `--reevaluate` after you update your profile or preferences, without needing to re-scrape the boards! |
+| **Resume capability** | If a run is interrupted (crash, Ctrl+C, power loss), re-running the same command picks up exactly where it left off. Two safety layers: `seen_jobs.csv` + a secondary check against the master shortlist.csv so a job is never re-scored even if `seen_jobs.csv` missed a write. |
 | **Smart HTTP retry** | Transient scrape failures (429 rate-limit, 5xx server errors, network drops) are retried with exponential backoff. Permanent blocks (400, 403, 406) are skipped immediately — no wasted time retrying Glassdoor or Naukri. |
 | **Active sites** | LinkedIn + Indeed (primary). Google Jobs aggregation recovers some Naukri-sourced postings. Glassdoor (400/403 blocked), Naukri (406 recaptcha), zip_recruiter (US-only) excluded from default config. |
 | **PowerShell-safe output** | All console output is ASCII-safe; stdout is reconfigured to UTF-8 with `errors=replace` so Unicode in job titles never crashes the terminal. jobspy's internal INFO/ERROR logging is suppressed at the root level so PowerShell no longer reports exit-code 1. |
@@ -80,7 +80,7 @@ uv --version
 ## Step 3 — Install the Python packages the pipeline needs
 
 ```powershell
-pip install -U python-jobspy requests
+pip install -U python-jobspy requests json-repair
 ```
 
 `python-jobspy` is the open-source scraping library that talks to LinkedIn, Indeed, and Google Jobs for you. Python 3.10 or newer is required.
@@ -368,17 +368,16 @@ Google Jobs searches in `config.json` partially recover Naukri-originated postin
 
 **`pipeline.py`** — the script itself. Read the comment at the top once; it explains exactly what it does and doesn't do.
 
-## Step 2 — Test it without using the AI
+## Step 2 — Test it without evaluating
 
 ```powershell
 cd C:\CareerAI\automation
-python pipeline.py --dry-run
+python pipeline.py --step scrape
 ```
 
-This scrapes, de-duplicates, and checks previous shortlists for closed positions — without calling Ollama. You'll see:
+This scrapes, de-duplicates, and caches jobs — without calling Ollama. You'll see:
 - How many new jobs were found
-- A `[NOT SCORED]` list of the first jobs in queue
-- A `[CLOSED]` list of APPLY/HOLD jobs from prior shortlists that no longer appear in today's scrape
+- The job data gets saved into `jobs_cache.jsonl` and `pending_eval.jsonl` for later evaluation.
 
 ## Step 3 — Run it for real
 
@@ -394,10 +393,9 @@ Reads career-profile.md, job-preferences.md, and target-companies.csv
 Scrapes LinkedIn + Indeed + Google Jobs for every search in config.json
 (transient 429/5xx errors retried automatically with backoff)
 ↓
-Checks all APPLY/HOLD jobs from previous shortlists — marks any that have
-disappeared from today's scrape as CLOSED in today's shortlist
-↓
 Drops jobs you've already seen or already applied to
+↓
+Saves new job descriptions to a local cache (jobs_cache.jsonl)
 ↓
 For each new job:
   - Role evaluation: Ollama scores it 0-100 via an explicit weighted rubric
@@ -405,7 +403,7 @@ For each new job:
   - Company evaluation: separate Ollama call scores the hiring company 0-100,
     anchored to your target-companies.csv for known priority companies
 ↓
-Writes shortlist\shortlist_YYYY-MM-DD.csv, sorted by role score
+Writes to the master shortlist\shortlist.csv, sorted by role score
 ↓
 Prints a terminal digest grouped by APPLY / HOLD / SKIP / CLOSED
 ```
@@ -428,16 +426,27 @@ Prints a terminal digest grouped by APPLY / HOLD / SKIP / CLOSED
 
 | Flag | What it does |
 |---|---|
-| `--dry-run` | Scrape + stale-check only; no Ollama calls |
-| `--limit N` | Score only the next N new jobs this run |
-| `--date YYYY-MM-DD` | Write to a specific date's shortlist (for next-morning reruns) |
-| `--no-stale-check` | Skip closed-position detection |
+| `--step scrape` | Scrape + cache only; no Ollama calls |
+| `--step evaluate` | Score jobs that were cached by the scrape step |
+| `--reevaluate TARGETS` | Rescore jobs based on new preferences (pass 'all' or a list of URLs) |
+| `--sync-csv` | Scan shortlists for manual `REEVALUATE` or `CHECK` triggers in the `decision` column |
+| `--limit N` | Score only the next N new jobs this run (deprecated, use steps instead) |
+| `--date YYYY-MM-DD` | (Deprecated) All data is now written to a single unified shortlist.csv |
 
 ### Resuming after interruption
 
 If the script is interrupted (Ctrl+C, crash, power loss), just re-run the same command. Two safety layers ensure no job is re-scored or double-written:
 1. `seen_jobs.csv` — written per-job immediately after shortlist write
-2. Today's shortlist CSV is also read at startup — any URL already in it is skipped even if `seen_jobs.csv` missed the write
+2. The master shortlist CSV is also read at startup — any URL already in it is skipped even if `seen_jobs.csv` missed the write
+
+### Manual triggers directly from the CSV
+
+You can use the CSV itself to instruct the pipeline to re-check or re-score specific jobs. If you manually edit a job's `decision` value to one of the trigger words below, save the CSV, and run `python pipeline.py --sync-csv`, the pipeline will process those rows and update the file:
+
+| `decision` trigger | What it does when you run `--sync-csv` |
+|---|---|
+| `REEVALUATE` | Reloads the job's original description from the cache, re-runs the Ollama scoring with your latest preferences, and overwrites the row with a new score and decision (APPLY/HOLD/SKIP). |
+| `CHECK` | Performs a live check against the job URL to see if it returns a 404 or contains obvious "job is closed" banners. If closed, the decision is updated to `CLOSED`. If it appears open, it reverts back to `HOLD`. *(Note: Job boards often block automated checks, so this check may falsely assume a blocked job is still OPEN.)* |
 
 ## Step 4 — Schedule it to run every morning (optional but recommended)
 
@@ -693,10 +702,6 @@ Levels.fyi's Chennai leaderboard is one useful benchmark, but it's built from se
 
 **All jobs are getting the same score (85)** → you're running an old version of `pipeline.py`. The v4 pipeline uses a weighted rubric prompt that forces real score spread. Pull the latest file.
 
-**Ollama call in `pipeline.py` times out or errors** → confirm `ollama serve` is running and `ollama_model` in `config.json` matches `ollama list`. Company scoring uses a separate 60s timeout; role scoring uses 180s.
-
-**Too many CLOSED positions on first run** → normal on the first run after upgrading to v4 — the stale checker is comparing all prior shortlists (which may be weeks old) against today's scrape. Subsequent runs will only show genuinely new closures.
-
 **Resume Matcher backend won't start** → re-check `.env` for a valid AI provider block; re-run `uv sync` inside `apps/backend`.
 
 **Model is too slow** → switch `ollama_model` in `config.json` to `llama3.1:8b` (no other file changes needed). Also match the model in Resume Matcher's `.env`.
@@ -718,8 +723,8 @@ Levels.fyi's Chennai leaderboard is one useful benchmark, but it's built from se
     [ ] ollama_model matches ollama list
     [ ] target_companies_path set
     [ ] searches tailored to your career lanes
-[ ] pipeline.py --dry-run tested: shows new jobs + CLOSED section (no errors)
-[ ] pipeline.py --limit 3 run: verify score spread (not all 85), company_score column present
+[ ] pipeline.py --step scrape tested: shows new jobs (no errors)
+[ ] pipeline.py --step evaluate run: verify score spread (not all 85), company_score column present
 [ ] (optional) Task Scheduler entry created for daily automatic run
 [ ] Resume Matcher cloned, backend + frontend running against local Ollama
 [ ] tracker\applications.csv created
