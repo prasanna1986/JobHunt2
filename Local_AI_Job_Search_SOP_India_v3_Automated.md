@@ -364,6 +364,20 @@ Naukri → Job Alerts → create one alert per career lane, Location: Chennai
 Check the alert emails / app inbox for ~5 minutes as part of your daily routine
 ```
 
+**How to evaluate Naukri jobs (or downloaded PDFs):**
+Since automated scraping fails for Naukri, you can manually inject these jobs into the pipeline using the `inject_jd.py` helper script.
+
+1. **Save the JD as text**: Copy the job description text from the Naukri link (or from your downloaded PDF) and save it to a plain text file, for example: `jd.txt`.
+2. **Run the injection script**: Open your terminal in the `automation` folder and run:
+   ```powershell
+   python inject_jd.py jd.txt "https://naukri.com/..." "Job Title" "Company Name"
+   ```
+3. **Score the job**: Tell the pipeline to evaluate pending jobs:
+   ```powershell
+   python pipeline.py --step evaluate
+   ```
+The job will be evaluated and added to your daily `shortlist.csv` just like the automated jobs.
+
 Google Jobs searches in `config.json` partially recover Naukri-originated postings via aggregation.
 
 **`pipeline.py`** — the script itself. Read the comment at the top once; it explains exactly what it does and doesn't do.
